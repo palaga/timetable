@@ -1,10 +1,12 @@
 (provide 'timetable)
 
+(require 'dash)
+
 (require 'org-clock)
 (require 'org-datetree)
 
 ;;; Used by convert functions
-(defconst timetable-org-ts-regex (rx "[" (group (1+ (not (char "]")))) "]"))
+(defconst timetable-org-ts-regex (rx "[" (group (1+ (not (any "]")))) "]"))
 (defconst timetable-week-regex (rx (| ?w ?W) "eek" (1+ blank) (group (1+ digit))))
 
 ;;; Date formatting used for headers
@@ -46,68 +48,61 @@
 (defcustom timetable-hours-per-week 32
   "Number of hours in your contract.")
 
-(defun timetable--get-fte ()
-  nil)
+(defvar math-additional-units
+  `((wd ,(format "%d hr" timetable-hours-per-day) "Workday")
+    (ww ,(format "%d hr" timetable-hours-per-week) "Workweek")
+    (fte ,(format "%d hr" timetable-hours-per-week-fulltime) "Full Time Equivalent")))
 
-(defun timetable--add-row (fields &optional fill-existing-row)
+
+(defun timetable--order-fields (fields)
+  (let ((result nil))
+    (dolist (key (reverse timetable-keys))
+      (let* ((field (plist-get fields key))
+             (string-field (format "%s" field)))
+        (push string-field result)))
+    result))
+
+(defun timetable--add-row (fields &optional no-newline)
   "Add a row to the timetable."
-  (unless fill-existing-row
-    (org-table-insert-row t))
+  (insert "|")
 
-  (let ((should-goto-next-field nil))
-    (dolist (key timetable-keys)
-      (if should-goto-next-field
-          (org-table-next-field)
-        (setq should-goto-next-field t))
+  (dolist (key timetable-keys)
+    (insert
+     (format "%s|" (or (plist-get fields key) ""))))
 
-      (let* ((field (or (plist-get fields key) ""))
-             (formatted-field (format "%s" field)))
-        (insert formatted-field)))))
+  (unless no-newline
+    (insert "\n")))
+
+(defun timetable--add-hline (&optional no-newline)
+  "Add a hline to the timetable."
+  (insert (concat "|-" (unless no-newline "\n"))))
 
 (defun timetable--create-report-table (entries)
   "Creates new table with a header and one empty row."
-  (let* ((header-length (number-to-string (length timetable-keys)))
-         (size (concat header-length "x1")))
-    (org-table-create size))
-  ;; Go to start of table
-  (org-table-next-field)
 
   ;; Header, hline and empty row
-  (timetable--add-row timetable-column-names t)
+  (timetable--add-row timetable-column-names)
 
   ;; ---------------------------------
-  (org-table-insert-hline) (next-line)
+  (timetable--add-hline)
 
   ;; Fill table
   (dolist (entry entries)
     (timetable--add-row entry))
 
-  ;; sort date column
-  (org-table-goto-column 3)
-  (org-table-sort-lines nil ?a)
-
   ;; ---------------------------------
-  (org-table-insert-hline) (next-line)
+  (timetable--add-hline)
 
-  (org-table-insert-row t)
+  (timetable--add-row nil)
 
-  (org-table-align)
-
-  (next-line))
+  (org-table-align))
 
 (defun timetable--create-summary-table (summary)
   "Creates new table with a header and one empty row."
-  (org-table-create "2x1")
-
   (dolist (item summary)
-    (org-table-next-field)
-    (insert (car item))
-    (org-table-next-field)
-    (org-table-eval-formula 4 (cdr item)))
+    (insert (format "|%s||\n" item)))
 
-  (org-table-align)
-
-  (next-line))
+  (org-table-align))
 
 (defun timetable--calc-day-type-minutes (work day-type)
   "Calculates the duration for DAY-TYPE, given the number of WORK minutes.
@@ -120,7 +115,7 @@ For sick days, report (timetable-hours-per-day - WORK) hours, so
  report zero hours."
   (let ((minutes-per-day (* 60 timetable-hours-per-day)))
     (cond ((string= day-type "vacation")
-           (- minutes-per-day))
+            minutes-per-day)
           ((string= day-type "holiday")
            minutes-per-day)
           ((string= day-type "sick")
@@ -143,7 +138,7 @@ For sick days, report (timetable-hours-per-day - WORK) hours, so
   (let* ((hc (org-heading-components))
          (heading (nth 4 hc))
          (heading+time (concat heading " 00:00"))
-         (heading-time-encoded (encode-time (parse-time-string heading+time)))
+         (heading-time-encoded (apply 'encode-time (parse-time-string heading+time)))
          (day (format-time-string "%a" heading-time-encoded))
          (week (format-time-string "%V" heading-time-encoded))
          (date (format-time-string "%F" heading-time-encoded))
@@ -180,81 +175,153 @@ For sick days, report (timetable-hours-per-day - WORK) hours, so
     (org-table-goto-line 1)
     (insert "!")))
 
-(defun timetable--table-format ()
-  (insert "#+TBLFM: ")
-  (insert
-   (string-join '("@>$2=vcount(@I..II)"
-                  "@>$1=vcount(rdup(@I..II))"
-                  "$4=vsum($5..$8);U"
-                  "@>$4..$8=vsum(@I..II);U")
-                "::"))
-  (org-ctrl-c-ctrl-c))
+(defun timetable--insert-metadata-list (type fields &optional field-separator no-newline no-eval-expresssion)
+  "Insert #+CONSTANTS and #+TBLFM metadata. Specify the TYPE
+first, either \"CONSTANTS\" or \"TBLFM\". Pass the FIELDS as an
+alist and, optionally, set the FIELD-SEPARATOR (defaults to a
+single space)."
+  (let* ((assignment (lambda (c)
+                       (format "%s=%s" (car c) (cdr c))))
+         (values (string-join
+                  (mapcar assignment fields)
+                  (or field-separator " "))))
+    (insert (format "#+%s: %s" type values))
 
-(defun timetable--insert-constants (constants)
-  (insert
-   (format
-    "#+CONSTANTS: %s\n"
-    (string-join
-     (mapcar
-      (lambda (c)
-        (format "%s=%s" (car c) (cdr c)))
-      constants)
-     " "))))
+    (unless no-eval-expresssion
+      (org-ctrl-c-ctrl-c))
+
+    (unless no-newline
+      (insert "\n"))))
 
 (defun org-dblock-write:timetable-report (args)
   (let* ((filename (format "%s" (plist-get args :file)))
          (tablename (plist-get args :tablename))
          (entries (remove nil (timetable--parse-file filename))))
-    (when tablename (insert (format "#+NAME: %s\n" tablename)))
-    (timetable--insert-constants
-     `(("contract" . ,timetable-hours-per-week)))
 
+    (when tablename
+      (insert (format "#+NAME: %s\n" tablename)))
     (timetable--create-report-table entries)
+    (timetable--insert-metadata-list
+     "TBLFM"
+     '(("@>$2" . "vcount(@I..II)")
+       ("@>$1" . "vcount(rdup(@I..II))")
+       ("$4" . "vsum($5..$8);U")
+       ("@>$4..$8" . "vsum(@I..II);U"))
+     "::" t)))
 
-    (timetable--table-format)))
+(defun org-dblock-write:timetable-week-report (args)
+  (let* ((filename (format "%s" (plist-get args :file)))
+         (tablename (plist-get args :tablename))
+         (entries (remove nil (timetable--parse-file filename))))
 
+    (insert
+     (format
+      "%S"
+      (seq-reduce
+       (lambda (result entry)
+         (let* ((week (plist-get entry :week))
+                (key (intern (concat ":week" week)))
+                (current-value (plist-get result key))
+                (work (plist-get entry :work)))
+           (plist-put
+            result key
+            (org-duration-from-minutes
+             (+ (org-duration-to-minutes (or current-value "0:00"))
+                (org-duration-to-minutes work))))))
+       entries
+       nil)))))
+
+(defun timetable--sum-org-durations (&rest list)
+  (org-duration-from-minutes
+   (apply '+
+          (--map
+           (let* ((first-char (substring it 0 1))
+                  (minus (string= first-char "-"))
+                  (value (if minus (substring it 1) it))
+                  (multiplier (if minus -1 1)))
+             (* multiplier (org-duration-to-minutes value)))
+           list))))
+
+(defun org-dblock-write:timetable-week-report (args)
+  (let* ((filename (format "%s" (plist-get args :file)))
+         (tablename (plist-get args :tablename))
+         (entries (remove nil (timetable--parse-file filename)))
+         (per-week (--group-by (plist-get it :week) entries)))
+
+    (timetable--create-report-table
+     (--map
+      (let ((week (car it)))
+       (--reduce-from
+        `(:week ,week
+          :work
+          ,(timetable--sum-org-durations
+            (or (plist-get it :work) "0:00")
+            (or (plist-get acc :work) "0:00"))
+          :holiday
+          ,(timetable--sum-org-durations
+            (or (plist-get it :holiday) "0:00")
+            (or (plist-get acc :holiday) "0:00"))
+          :sick
+          ,(timetable--sum-org-durations
+            (or (plist-get it :sick) "0:00")
+            (or (plist-get acc :sick) "0:00"))
+          :vacation
+          ,(timetable--sum-org-durations
+            (or (plist-get it :vacation) "0:00")
+            (or (plist-get acc :vacation) "0:00")))
+        '()
+        (cdr it)))
+      per-week))))
+
+
+(defmacro timetable--with-work-units (&rest body)
+  `(let ((math-additional-units
+           `((wd ,(format "%d * hr" timetable-hours-per-day) "Workday")
+             (ww ,(format "%d * hr" timetable-hours-per-week) "Workweek")
+             (fte ,(format "%d * hr" timetable-hours-per-week-fulltime) "Full Time Equivalent"))))
+     ,@body))
 
 (defun org-dblock-write:timetable-summary (args)
   (let* ((tablename (plist-get args :tablename))
          (from-report (plist-get args :from-report))
          (math-additional-units
-          '((wd (format "%d * hr" timetable-hours-per-day) "Workday")
-            (ww (format "%d * hr" timetable-hours-per-week) "Workweek")
-            (fte (format "%d * hr" timetable-hours-per-week-fulltime) "Full Time Equivalent"))))
+          `((wd ,(format "%d * hr" timetable-hours-per-day) "Workday")
+            (ww ,(format "%d * hr" timetable-hours-per-week) "Workweek")
+            (fte ,(format "%d * hr" timetable-hours-per-week-fulltime) "Full Time Equivalent"))))
+    ;; (insert (format "%S" math-additional-units))
     (when tablename (insert (format "#+NAME: %s\n" tablename)))
-    (timetable--insert-constants
-     `(("contract" . ,timetable-hours-per-week)
-       ("vacation" . ,timetable-vacation-days-fulltime)))
+    (timetable--insert-metadata-list "CONSTANTS"
+                                     `(("contract" . ,timetable-hours-per-week)
+                                       ("vacation" . ,timetable-vacation-days-fulltime)))
 
     (timetable--create-summary-table
-     `(("Contract hours per week" . "$contract hr")
-       ("Number of weeks worked" . ,(format "remote(%s, @>$1) ww" from-report))
-       ("FTE" . "uconvert(1 ww, fte)")
-       ("Vacation days" . "uconvert(usimplify($vacation wd * @-1 / fte), ww + wd + hr)" )
-       ("Hour total" . ,(format "uconvert(%d min, ww + wd + hr + min)"
-                                (org-duration-to-minutes (org-table-get-remote-range (format "%s" from-report) "@>$4"))))
-       ("Free time left" . "uconvert(usimplify(@-1 + @-2 - @-4), ww + wd + hr + min)")))))
+     '("Contract hours per week"
+       "Number of weeks worked"
+       "FTE"
+       "Vacation days left"
+       "Hour total"
+       "Free time left"))
 
-(defmath workdays (hours)
-  "Given the number of hours, compute number of workdays."
-  (/ hours (float timetable-hours-per-day)))
+    (timetable--insert-metadata-list "TBLFM"
+                                     `(("@1$>" . "$contract hr")
+                                       ("@2$>" . ,(format "remote(%s, @>$1) ww" from-report))
+                                       ("@3$>" . "uconvert(1 ww, fte)")
+                                       ("@4$>" . ,(format "uconvert($vacation wd - %d min, wd)"
+                                                          (org-duration-to-minutes
+                                                           (org-table-get-remote-range
+                                                            (format "%s" from-report) "@>$>"))))
+                                       ("@5$>" . ,(format "uconvert(%d min, ww + wd + hr + min)"
+                                                          (org-duration-to-minutes
+                                                           (org-table-get-remote-range
+                                                            (format "%s" from-report) "@>$4"))))
+                                       ("@6$>" . "uconvert(usimplify((@5 - @2) + @4), ww + wd + hr + min)"))
+                                     "::" t)))
 
 (defmath uconvert (expr unit)
   (calc-eval
    (math-convert-units
     (calc-eval expr 'raw)
     (calc-eval unit 'raw))))
-
-(defmath workweeks (hours)
-    "Given the number of hours, compute number of workweekss."
-    (/ hours (float timetable-hours-per-week)))
-
-(defun timetable--calc-eval (expression)
-  (let ((math-additional-units
-         '((wd "8 * hr" "Workday")
-           (ww "32 * hr" "Workweek")
-           (fte "40 * hr" "Full Time Equivalent"))))
-    (calc-eval expression)))
 
 ;;; Minor mode functions
 (defvar timetable-mode-map
@@ -318,11 +385,12 @@ used. "
            (string-match timetable-org-ts-regex heading))
       (let* ((date (match-string 1 heading))
              (date-time (concat date " 00:00"))
-             (encoded-time (encode-time (parse-time-string date-time)))
+             (encoded-time (apply 'encode-time (parse-time-string date-time)))
              (new-headline (format-time-string timetable-day-format encoded-time)))
         (org-edit-headline new-headline)))
      ;; Report skipping
      (t (message "Skipping header '%s'..." heading)))))
+
 
 (defun timetable-convert-to-datetree ()
   (interactive)
@@ -330,6 +398,9 @@ used. "
     (beginning-of-buffer)
     (org-insert-heading)
     (insert year)
+
+    (run-python)
+    (python-shell-send-string-no-output "from datetime import datetime as dt")
 
     (org-map-entries
      (lambda ()
@@ -341,9 +412,8 @@ used. "
                 (org-demote-subtree)
                 (org-edit-headline (replace-regexp-in-string "W" "-W" heading)))
                ((= level 3)
-                (let* ((date-time (concat heading "T00:00"))
-                       (encoded-time (encode-time (iso8601-parse date-time)))
-                       (new-headline (format-time-string "%F %A" encoded-time)))
+                (let* ((fixed-heading (replace-regexp-in-string "-0" "-" heading))
+                       (new-headline (python-shell-send-string-no-output (format "print(dt.strftime(dt.strptime(\"%s\", \"%%YW%%W-%%w\"), \"%%Y-%%m-%%d %%A\"))" fixed-heading))))
                   (org-edit-headline new-headline)))))))))
 
 (defun timetable-convert ()
