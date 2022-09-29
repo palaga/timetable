@@ -1,0 +1,57 @@
+#!/bin/sh
+
+: ${XDG_STATE_HOME:=$HOME/.local/state}
+
+mkdir -p "$XDG_STATE_HOME"
+
+: ${TT_REC=$XDG_STATE_HOME/timetable.rec}
+: ${TT_DB=$XDG_STATE_HOME/timetable.db}
+
+importCsv() {
+    printf '.import "| rec2csv -t %s %s" %s_tmp --csv --schema temp' \
+           "$1" "$2" "$1"
+}
+
+sync() {
+    sqlite3 \
+        -cmd "$(importCsv TimeTableConfig $TT_REC)" \
+        -cmd "$(importCsv TimeTable $TT_REC)" \
+        -cmd "$(importCsv Contract $TT_REC)" \
+        -cmd "$(importCsv ExtraFreeDays $TT_REC)" \
+        -cmd ".trace stderr --stmt" \
+        "$TT_DB" '
+      CREATE TABLE IF NOT EXISTS TimeTable (kind, start int, end int);
+
+      CREATE VIEW IF NOT EXISTS Overview (date, kind, hours) AS
+        SELECT date(start, "unixepoch"), sum((end - start) / 3600.)
+        FROM TimeTable
+        GROUP BY date(start, "unixepoch"), kind;
+
+      INSERT OR REPLACE INTO TimeTable (rowid, kind, start, end)
+        SELECT Id, Kind, unixepoch(Start), unixepoch(End)
+        FROM TimeTable_tmp
+        WHERE true;
+  '
+}
+
+check() {
+    printf 'Checking "%s"...\n' "$TT_REC"
+    if recfix "$TT_REC"; then
+        printf '✅ All is fine!\n'
+    else
+        printf '❌ Errors found!\n'
+    fi
+}
+
+case "$1" in
+    sync) sync;;
+    check) check;;
+    *) printf 'Usage: %s [subcommand]\n' "$0"
+       printf '\tsync   Sync rec file with database.\n'
+       printf '\tcheck  Do integrity check of the rec file.\n'
+
+       printf '\nENVIRONMENT VARIABLES\n'
+       printf '\tTT_REC  Time table rec file (%s)\n' "$TT_REC"
+       printf '\tTT_DB   Time table sqlite db file (%s)\n' "$TT_DB"
+       ;;
+esac
