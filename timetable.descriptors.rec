@@ -1,0 +1,43 @@
+%rec: TimeTableConfig
+%size: 1
+%mandatory: FullTimeWeek VacationWeeks
+%unique: FullTimeWeek VacationWeeks
+%type: FullTimeWeek range 0 MAX
+%type: VacationWeeks range 0 MAX
+
+%rec: Contract
+%mandatory: FTE Start End
+%key: Start
+%unique: FTE Start End
+%sort: Start
+%type: Start,End date
+%type: FTE real
+%constraint: FTE > 0
+%constraint: Start << End
+
+# Useful for corrections
+%rec: ExtraFreeDays
+%mandatory: Granted Reason
+%allowed: ValidFor
+%unique: Granted ValidFor Reason
+%type: Granted date
+%type: ValidFor date
+
+%rec: TimeTable
+%key: Id
+%mandatory: Kind Start
+%allowed: End
+%sort: Start
+%unique: Start End
+%typedef: Kind_t enum
++ INPROGRESS
++ WORK
++ SICK
++ FREEDAY
++ HOLIDAY
+%type: Id int
+%type: Kind Kind_t
+%type: Start,End date
+%constraint: Start << End
+%constraint: Kind != "INPROGRESS" => #End
+%constraint: Kind = "INPROGRESS" => #End = 0
