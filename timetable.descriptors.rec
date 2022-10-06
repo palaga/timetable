@@ -1,13 +1,15 @@
 %rec: TimeTableConfig
 %size: 1
-%mandatory: FullTimeWeek VacationWeeks
+%key: Id
+%mandatory: FullTimeWeek VacationWeeks FullDayHours
 %unique: FullTimeWeek VacationWeeks
 %type: FullTimeWeek range 0 MAX
 %type: VacationWeeks range 0 MAX
+%type: FullDayHours range 0 24
 
 %rec: Contract
 %mandatory: FTE Start End
-%key: Start
+%key: Id
 %unique: FTE Start End
 %sort: Start
 %type: Start,End date
@@ -17,6 +19,7 @@
 
 # Useful for corrections
 %rec: ExtraFreeDays
+%key: Id
 %mandatory: Granted Reason
 %allowed: ValidFor
 %unique: Granted ValidFor Reason
@@ -33,7 +36,7 @@
 + INPROGRESS
 + WORK
 + SICK
-+ FREEDAY
++ FREE
 + HOLIDAY
 %type: Id int
 %type: Kind Kind_t
