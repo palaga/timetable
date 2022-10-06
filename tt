@@ -1,41 +1,73 @@
 #!/bin/sh
 
 : ${XDG_STATE_HOME:=$HOME/.local/state}
-
-mkdir -p "$XDG_STATE_HOME"
-
 : ${TT_REC=$XDG_STATE_HOME/timetable.rec}
 : ${TT_DB=$XDG_STATE_HOME/timetable.db}
 
-importCsv() {
-    printf '.import "| rec2csv -t %s %s" %s_tmp --csv --schema temp' \
-           "$1" "$2" "$1"
+set -e
+
+importTable() {
+    tablename="$1"; shift
+    spec=$(printf %s\\n "$@" | while read x y z; do echo "$x $y"; done | paste -sd,)
+    num_records="$(recsel -t "$tablename" -c "$TT_REC")"
+
+    printf '.print "📃 Importing %d records from %s..."\n' "$num_records" "$tablename"
+    printf 'CREATE TABLE IF NOT EXISTS %s (%s);\n' "$tablename" "$spec"
+
+    if [ "$num_records" -gt 0 ]; then
+        columns=$(printf %s\\n "$@" | while read x y z; do echo "$x"; done | paste -sd,)
+        column_queries=$(printf %s\\n "$@" | while read x y z; do echo "${z:-$x}"; done | paste -sd,)
+
+        printf '.import "| rec2csv -t %s %s" %s_tmp --csv --schema temp\n' \
+               "$tablename" "$TT_REC" "$tablename"
+
+        printf 'INSERT OR REPLACE INTO %s (rowid, %s)\n' "$tablename" "$columns"
+        printf '  SELECT Id, %s\n' "$column_queries"
+        printf '  FROM %s_tmp\n' "$tablename"
+        printf '  WHERE true;\n'
+    fi
 }
 
-sync() {
-    sqlite3 \
-        -cmd "$(importCsv TimeTableConfig $TT_REC)" \
-        -cmd "$(importCsv TimeTable $TT_REC)" \
-        -cmd "$(importCsv Contract $TT_REC)" \
-        -cmd "$(importCsv ExtraFreeDays $TT_REC)" \
-        -cmd ".trace stderr --stmt" \
-        "$TT_DB" '
-      CREATE TABLE IF NOT EXISTS TimeTable (kind, start int, end int);
+cmd_sync() {
+    # Create directory if needed
+    directory="$(dirname $TT_DB)"
+    [ -d "$directory" ] || mkdir -p "$directory"
 
-      CREATE VIEW IF NOT EXISTS Overview (date, kind, hours) AS
-        SELECT date(start, "unixepoch"), sum((end - start) / 3600.)
-        FROM TimeTable
-        GROUP BY date(start, "unixepoch"), kind;
+    {
+        # echo ".trace stderr --stmt"
+        importTable ExtraFreeDays Granted Reason ValidFor
+        importTable TimeTableConfig "FullTimeWeek int" "VacationWeeks int"
+        importTable Contract "FTE int" "Start int unixepoch(Start)" "End int unixepoch(End)"
+        importTable TimeTable Kind "Start int unixepoch(Start)" "End int unixepoch(End)"
 
-      INSERT OR REPLACE INTO TimeTable (rowid, kind, start, end)
-        SELECT Id, Kind, unixepoch(Start), unixepoch(End)
-        FROM TimeTable_tmp
-        WHERE true;
-  '
+        cat <<-EOF
+.print "📃 Create Overview view..."
+CREATE VIEW IF NOT EXISTS Overview (week, date, kind, hours) AS
+  SELECT CAST(strftime("%W", start, "unixepoch") AS int), date(start, "unixepoch"), kind, sum((end - start) / 3600.)
+  FROM TimeTable
+  GROUP BY date(start, "unixepoch"), kind;
+
+.print "📃 Create Overtime view..."
+CREATE VIEW IF NOT EXISTS Overtime (year, week, hours) AS
+  SELECT CAST(strftime("%Y", date) AS int), CAST(strftime("%W", date) AS int), sum(hours) - 32
+  FROM Overview AS o
+  WHERE kind <> "FREE"
+  GROUP BY strftime("%Y", date), strftime("%W", date);
+
+.print "📃 Create ContractFraction view..."
+CREATE VIEW IF NOT EXISTS ContractFraction(fte, fraction, start, end) AS
+  SELECT (julianday(end, "unixepoch") - julianday(start, "unixepoch")) / (julianday(start, "unixepoch", "1 year") - julianday(start, "unixepoch")),
+         *
+  FROM Contract;
+EOF
+    } | sqlite3 "$TT_DB" \
+        && printf '✅ All is fine!\n' \
+        || printf '❌ Errors found!\n'
 }
 
-check() {
-    printf 'Checking "%s"...\n' "$TT_REC"
+cmd_check() {
+    printf '👀 Checking "%s"...\n' "$TT_REC"
+
     if recfix "$TT_REC"; then
         printf '✅ All is fine!\n'
     else
@@ -43,15 +75,28 @@ check() {
     fi
 }
 
-case "$1" in
-    sync) sync;;
-    check) check;;
+cmd_clean() {
+    printf '⚠️ Removing "%s"...' "$TT_DB"
+    rm -f "$TT_DB" && echo "✔️"
+}
+
+cmd_shell() {
+    sqlite3 "$TT_DB" "$@"
+}
+
+cmd="$1"; shift
+case "$cmd" in
+    sync) cmd_sync;;
+    check) cmd_check;;
+    shell) cmd_shell "$@";;
+    clean) cmd_clean;;
     *) printf 'Usage: %s [subcommand]\n' "$0"
        printf '\tsync   Sync rec file with database.\n'
        printf '\tcheck  Do integrity check of the rec file.\n'
+       printf '\tshell  Start sqlite3 shell on timetable db.\n'
+       printf '\tclean  Delete timetable db.\n'
 
        printf '\nENVIRONMENT VARIABLES\n'
        printf '\tTT_REC  Time table rec file (%s)\n' "$TT_REC"
        printf '\tTT_DB   Time table sqlite db file (%s)\n' "$TT_DB"
-       ;;
 esac
